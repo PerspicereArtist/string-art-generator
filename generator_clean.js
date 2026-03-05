@@ -741,6 +741,10 @@ function pickBestNext(curPin, cIdx){
 
         const B = pins[cand];
 
+        // Edge reuse prevention: reject recently used undirected edges.
+        const eKey = edgeKey(curPin, cand);
+        if(recentEdgeSet.has(eKey)) continue;
+
         // Hard rule enforcement (enabled flags must reject candidates, not penalize score).
         if(noSameEdgeConnections && sameEdge(curPin, cand, pins)) continue;
         if(noSameRowOrColumn && (Math.abs(A.x - B.x) < 1e-6 || Math.abs(A.y - B.y) < 1e-6)) continue;
