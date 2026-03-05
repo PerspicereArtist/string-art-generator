@@ -8,13 +8,18 @@
 //
 // Drop-in for generator_preset_advanced_fade.html (keeps same element IDs).
 
-(() => {
+;(() => {
   'use strict';
 
   // ---------- DOM helpers ----------
   const $ = (id) => /** @type {HTMLElement} */(document.getElementById(id));
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   const lerp = (a, b, t) => a + (b - a) * t;
+
+  // ---------- Residual-hotspot targeting (easy tuning) ----------
+  const HOTSPOT_PERCENT = 0.02;
+  const HOTSPOT_WEIGHT = 1.5;
+  const HOTSPOT_UPDATE_STEPS = 25;
 
   
   function setInputClamp(id, value){
@@ -125,7 +130,7 @@ function setText(id, v){ const el = $(id); if(el) el.textContent = String(v); }
   
   // ---------- Sequence export compatibility ----------
   // Your legacy replay reader expects:
-  //   # color <name>   (or # colour blue)
+  //   # color <name>
   //   <pin>
   //   <pin>
   // ... (walk format, one pin per line)
@@ -141,8 +146,6 @@ function setText(id, v){ const el = $(id); if(el) el.textContent = String(v); }
   }
   function headerForColorName(name){
     const n = (name||'').toLowerCase();
-    // Match the "stacked" file quirk: blue uses '# colour blue'
-    if(n === 'blue') return '# colour blue';
     return '# color ' + n;
   }
   function hexFromColorName(name){
@@ -155,6 +158,37 @@ function setText(id, v){ const el = $(id); if(el) el.textContent = String(v); }
     if(n.startsWith('#')) return n;
     return '#ffffff';
   }
+
+  function validateSequenceText(text){
+    const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+    let sawHeader = false;
+    let pinCountAfterHeader = 0;
+    let previousWasHeader = false;
+
+    for(let i=0;i<lines.length;i++){
+      const raw = lines[i];
+      if(raw === '') continue;
+
+      if(raw.startsWith('#')){
+        if(!raw.startsWith('# color ')) return { ok:false, reason:`Invalid header at line ${i+1}: use # color` };
+        if(previousWasHeader) return { ok:false, reason:`Repeated headers without pins near line ${i+1}` };
+        sawHeader = true;
+        pinCountAfterHeader = 0;
+        previousWasHeader = true;
+        continue;
+      }
+
+      if(!/^\d+$/.test(raw)) return { ok:false, reason:`Invalid pin line ${i+1}: expected integer` };
+      if(!sawHeader) return { ok:false, reason:`Pin before first # color header at line ${i+1}` };
+
+      pinCountAfterHeader += 1;
+      previousWasHeader = false;
+    }
+
+    if(!sawHeader) return { ok:false, reason:'Missing # color header' };
+    return { ok:true, reason:'ok' };
+  }
+
 
 function getPalette(){
     /** @type {PaletteColor[]} */
@@ -519,6 +553,40 @@ function buildPins(wPins, hPins, workW, workH){
 
   function sameEdge(a, b, pins){ return pins[a].edge === pins[b].edge; }
 
+  function edgeKey(a, b){
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    return lo + '-' + hi;
+  }
+
+  function ruleFlag(name, fallback){
+    const bag = (typeof window !== 'undefined' && window.__solverRules) ? window.__solverRules : null;
+    if(bag && Object.prototype.hasOwnProperty.call(bag, name)) return !!bag[name];
+    return fallback;
+  }
+
+  function isCornerPin(P, workW, workH){
+    const x0 = Math.abs(P.x - 0) < 1e-6;
+    const x1 = Math.abs(P.x - (workW - 1)) < 1e-6;
+    const y0 = Math.abs(P.y - 0) < 1e-6;
+    const y1 = Math.abs(P.y - (workH - 1)) < 1e-6;
+    return (x0 || x1) && (y0 || y1);
+  }
+
+  function shouldRejectCornerAdjacent(A, B, workW, workH){
+    if(!isCornerPin(A, workW, workH) && !isCornerPin(B, workW, workH)) return false;
+    // Hard rule: avoid using a corner pin with a pin on one of the corner's adjacent edges.
+    if(isCornerPin(A, workW, workH)){
+      if(A.edge === 0) return (B.edge === 1 || B.edge === 3);
+      if(A.edge === 2) return (B.edge === 1 || B.edge === 3);
+    }
+    if(isCornerPin(B, workW, workH)){
+      if(B.edge === 0) return (A.edge === 1 || A.edge === 3);
+      if(B.edge === 2) return (A.edge === 1 || A.edge === 3);
+    }
+    return false;
+  }
+
   // ---------- Solver core ----------
   async function runSolver({draft, liveDraw=true, renderMul=4}){
     if(!imgLoaded){ alert('Load an image first.'); return; }
@@ -565,7 +633,7 @@ function buildPins(wPins, hPins, workW, workH){
     const tokenLen = Object.create(null);
     for(const b of sched.blocks){ tokenLen[b.token.toLowerCase()] = b.len; }
 
-    /** @type {{mode:0|1, blockLen:number, blockPos:number, scores:number[], newfracs:number[], bestAvg:number, hotspotX:number, hotspotY:number, nextHotAt:number}[]} */
+    /** @type {{mode:0|1, blockLen:number, blockPos:number, scores:number[], newfracs:number[], bestAvg:number, hotspotX:number, hotspotY:number, nextHotAt:number, hotspotMask:Uint8Array}[]} */
     const colourState = palette.map(p => ({
       mode: 0,
       blockLen: tokenLen[p.hex.toLowerCase()] || 0,
@@ -575,42 +643,77 @@ function buildPins(wPins, hPins, workW, workH){
       bestAvg: 0,
       hotspotX: workW * 0.5,
       hotspotY: workH * 0.5,
-      nextHotAt: 0
+      nextHotAt: 0,
+      hotspotMask: new Uint8Array(N)
     }));
+
+    // Rule flags are treated as hard constraints during candidate filtering (reject, never penalize).
+    const noSameEdgeConnections = ruleFlag('noSameEdgeConnections', true);
+    const noSameRowOrColumn = ruleFlag('noSameRowOrColumn', false);
+    const cornerAvoidsAdjacentEdges = ruleFlag('cornerAvoidsAdjacentEdges', false);
+
+    // Backtracking prevention state: previous segment start pin for A->B->A rejection.
+    let prevPrevPin = -1;
+
+    // Highway suppression state: track recent edge usage counts in a sliding window.
+    const HIGHWAY_WINDOW = 400;
+    const recentEdgeQueue = [];
+    const recentEdgeCounts = new Map();
 
     function updateHotspotForColour(cIdx){
       const resid = residuals[cIdx];
-      let best = -1, bestIdx = 0;
-      // scan coarse grid for speed
-      const stride = 2;
-      for(let y=0;y<workH;y+=stride){
-        let row = y*workW;
-        for(let x=0;x<workW;x+=stride){
-          const idx = row + x;
-          const v = resid[idx];
-          if(v > best){ best = v; bestIdx = idx; }
+      const st = colourState[cIdx];
+      const mask = st.hotspotMask;
+      mask.fill(0);
+
+      const take = Math.max(1, Math.floor(N * HOTSPOT_PERCENT));
+      const topVals = [];
+      for(let i=0;i<N;i++){
+        const v = resid[i];
+        if(topVals.length < take){
+          topVals.push(v);
+          if(topVals.length === take) topVals.sort((a,b)=>a-b);
+          continue;
+        }
+        if(v > topVals[0]){
+          topVals[0] = v;
+          // keep ascending with tiny insertion pass (k is small enough in practice)
+          let j = 0;
+          while(j+1<topVals.length && topVals[j] > topVals[j+1]){
+            const t = topVals[j];
+            topVals[j] = topVals[j+1];
+            topVals[j+1] = t;
+            j++;
+          }
         }
       }
-      colourState[cIdx].hotspotX = bestIdx % workW;
-      colourState[cIdx].hotspotY = (bestIdx / workW) | 0;
+
+      const threshold = topVals.length ? topVals[0] : 0;
+      let sumX = 0, sumY = 0, count = 0;
+      for(let i=0;i<N;i++){
+        if(resid[i] >= threshold){
+          mask[i] = 1;
+          sumX += (i % workW);
+          sumY += ((i / workW) | 0);
+          count++;
+        }
+      }
+
+      if(count > 0){
+        st.hotspotX = sumX / count;
+        st.hotspotY = sumY / count;
+      }
     }
 
-    function distPointToSegment(px, py, ax, ay, bx, by){
-      const abx = bx - ax, aby = by - ay;
-      const apx = px - ax, apy = py - ay;
-      const ab2 = abx*abx + aby*aby;
-      let t = ab2 > 0 ? (apx*abx + apy*aby) / ab2 : 0;
-      t = t < 0 ? 0 : (t > 1 ? 1 : t);
-      const cx = ax + abx * t, cy = ay + aby * t;
-      const dx = px - cx, dy = py - cy;
-      return Math.sqrt(dx*dx + dy*dy);
-    }
 
 
     // angle histogram
-    const ANG_BINS = 18;
+    const ANG_BINS = 36;
     const angHist = new Uint32Array(ANG_BINS);
     const angFill = new Float32Array(ANG_BINS);
+    const ANG_WINDOW = 500;
+    const recentAngleQueue = [];
+    const recentAngleCounts = new Uint16Array(ANG_BINS);
 
     // helper: angle bin for a segment (0..pi)
     function angleBin(ax,ay,bx,by){
@@ -654,17 +757,26 @@ function pickBestNext(curPin, cIdx){
 
       const temp = 0.03 + 0.25*f; // higher fade => more exploration
       const isDetail = (st.mode === 1);
+      const HIGHWAY_PENALTY_K = 0.22; // easy tuning knob for corridor/highway suppression
 
-      // keep hotspot fresh, but only once the block has meaningfully progressed
-      if(isDetail && st.blockPos >= st.nextHotAt){
+      // refresh hotspot on a fixed cadence (every N steps)
+      if(st.blockPos >= st.nextHotAt){
         updateHotspotForColour(cIdx);
-        st.nextHotAt = st.blockPos + 40; // update every ~40 lines in detail mode
+        st.nextHotAt = st.blockPos + HOTSPOT_UPDATE_STEPS;
       }
 
       for(const cand of candidates){
         if(cand===curPin) continue;
-        if(sameEdge(curPin, cand, pins)) continue; // strict
+
+        // Hard ban immediate backtracking: reject A -> B -> A.
+        if(prevPrevPin >= 0 && cand === prevPrevPin) continue;
+
         const B = pins[cand];
+
+        // Hard rule enforcement (enabled flags must reject candidates, not penalize score).
+        if(noSameEdgeConnections && sameEdge(curPin, cand, pins)) continue;
+        if(noSameRowOrColumn && (Math.abs(A.x - B.x) < 1e-6 || Math.abs(A.y - B.y) < 1e-6)) continue;
+        if(cornerAvoidsAdjacentEdges && shouldRejectCornerAdjacent(A, B, workW, workH)) continue;
 
         const idxs = sampleLineWeights(A.x, A.y, B.x, B.y, workW, workH);
 
@@ -699,10 +811,6 @@ function pickBestNext(curPin, cIdx){
           const alpha = 0.65; // how strongly to push peak residuals
           s = (1 - alpha) * sum + alpha * sumHi;
 
-          // hotspot guidance (focus remaining work)
-          const d = distPointToSegment(st.hotspotX, st.hotspotY, A.x, A.y, B.x, B.y);
-          s *= (1 + 0.9 / (1 + d));
-
           // compress very long chords to avoid corridor domination
           const dx = (B.x - A.x), dy = (B.y - A.y);
           const len = Math.sqrt(dx*dx + dy*dy);
@@ -710,11 +818,25 @@ function pickBestNext(curPin, cIdx){
           s *= 1.0 / (1.0 + 2.0 * lenN);
         }
 
+        // hotspot guidance: reward sampled pixels that intersect top residual hotspots.
+        let hotspotHits = 0;
+        const hotspotMask = st.hotspotMask;
+        for(const [idx] of idxs){
+          if(hotspotMask[idx]) hotspotHits += 1;
+        }
+        s += hotspotHits * HOTSPOT_WEIGHT;
+
+        // Highway suppression (soft): penalize edges that were used often in the recent window.
+        const eKey = edgeKey(curPin, cand);
+        const recentCount = recentEdgeCounts.get(eKey) || 0;
+        s -= HIGHWAY_PENALTY_K * recentCount;
+
         // angle balancing (lightweight): discourage bins that are overused
         const bin = angleBin(A.x,A.y,B.x,B.y);
         const bal = clamp(angleBal/50, 0, 1);
         if(bal>0){
-          const fill = angFill[bin] / (1 + angHist[bin]);
+          const recent = recentAngleCounts[bin];
+          const fill = (angFill[bin] / (1 + angHist[bin])) + (recent / Math.max(1, ANG_WINDOW));
           s *= 1.0 / (1.0 + bal * 2.2 * fill);
         }
 
@@ -807,16 +929,25 @@ function pickBestNext(curPin, cIdx){
       // apply
       applyLine(cIdx, pick.idxs, baseStrength);
 
+      // Highway suppression bookkeeping: maintain counts in a recent sliding edge window.
+      const usedEdge = edgeKey(curPin, pick.pin);
+      recentEdgeQueue.push(usedEdge);
+      recentEdgeCounts.set(usedEdge, (recentEdgeCounts.get(usedEdge) || 0) + 1);
+      if(recentEdgeQueue.length > HIGHWAY_WINDOW){
+        const dropped = recentEdgeQueue.shift();
+        if(dropped !== undefined){
+          const c = (recentEdgeCounts.get(dropped) || 0) - 1;
+          if(c > 0) recentEdgeCounts.set(dropped, c);
+          else recentEdgeCounts.delete(dropped);
+        }
+      }
+
+      // Backtracking prevention state update for next move.
+      prevPrevPin = curPin;
+
       // ---- adaptive phase switch per colour (A: based on "stopped finding new work")
       const st = colourState[cIdx];
       st.blockPos += 1;
-      // Legacy-compatible: repeat colour headers every 200 moves within a colour block (matches stackedYBWB)
-      if(st.blockPos > 0 && (st.blockPos % 200) === 0 && st.blockPos < st.blockLen){
-        const cname2 = colorNameFromHex(tok);
-        seqLines.push(headerForColorName(cname2));
-        seqLines.push(String(curPin));
-      }
-
       // track rolling improvement + novelty
       st.scores.push(pick.score);
       if(st.scores.length > 50) st.scores.shift();
@@ -842,6 +973,12 @@ function pickBestNext(curPin, cIdx){
       // update angle stats
       angHist[pick.bin] += 1;
       angFill[pick.bin] += pick.score;
+      recentAngleQueue.push(pick.bin);
+      recentAngleCounts[pick.bin] += 1;
+      if(recentAngleQueue.length > ANG_WINDOW){
+        const oldBin = recentAngleQueue.shift();
+        if(oldBin !== undefined && recentAngleCounts[oldBin] > 0) recentAngleCounts[oldBin] -= 1;
+      }
 
       // draw
       const A = pins[curPin];
@@ -912,10 +1049,61 @@ function pickBestNext(curPin, cIdx){
       octx.globalAlpha = 1;
     }
 
+
+    function validateSequence(lines){
+      const segments = [];
+      let lastPin = null;
+      for(const line of lines){
+        if(!line) continue;
+        if(line.startsWith('# color ') || line.startsWith('# colour ')){
+          lastPin = null;
+          continue;
+        }
+        const pin = parseInt(line, 10);
+        if(!Number.isFinite(pin)) continue;
+        if(lastPin === null){
+          lastPin = pin;
+          continue;
+        }
+        segments.push([lastPin, pin]);
+        lastPin = pin;
+      }
+
+      let backtrackViolations = 0;
+      let ruleViolations = 0;
+
+      for(let i=1; i<segments.length; i++){
+        const p = segments[i-1];
+        const q = segments[i];
+        if(p[0] === q[1] && p[1] === q[0]) backtrackViolations += 1;
+      }
+
+      for(const seg of segments){
+        const a = seg[0], b = seg[1];
+        const A = pins[a], B = pins[b];
+        if(noSameEdgeConnections && sameEdge(a, b, pins)) ruleViolations += 1;
+        if(noSameRowOrColumn && (Math.abs(A.x - B.x) < 1e-6 || Math.abs(A.y - B.y) < 1e-6)) ruleViolations += 1;
+        if(cornerAvoidsAdjacentEdges && shouldRejectCornerAdjacent(A, B, workW, workH)) ruleViolations += 1;
+      }
+
+      console.log('[validateSequence] segments=', segments.length,
+        'A-B-A violations=', backtrackViolations,
+        'rule violations=', ruleViolations);
+    }
+
+    validateSequence(seqLines);
+
+    const seqText = seqLines.join('\n');
+    const seqCheck = validateSequenceText(seqText);
+    if(!seqCheck.ok){
+      alert('Sequence export validation failed: ' + seqCheck.reason);
+      throw new Error('Sequence export validation failed: ' + seqCheck.reason);
+    }
+
     setText('statusRight', 'Done.');
     setText('outInfo', `Done (${tokens.length} lines).`);
 
-    return { seqText: seqLines.join('\n'), workW, workH };
+    return { seqText, workW, workH };
   }
 
   
@@ -1036,7 +1224,7 @@ function pickBestNext(curPin, cIdx){
     try{
       const r = await runSolver({draft:false, liveDraw:false, renderMul:4});
       // keep latest in memory for create download convenience
-      let text = r?.seqText || '';
+      let text = (r && r.seqText) || '';
       if(text.indexOf('\\n') !== -1 && text.indexOf('\n') === -1){
         text = text.replace(/\\r\\n/g,'\n').replace(/\\n/g,'\n');
       }
@@ -1050,7 +1238,7 @@ function pickBestNext(curPin, cIdx){
   $('create').addEventListener('click', async ()=>{
     try{
       const r = await runSolver({draft:false});
-      let text = r?.seqText || '';
+      let text = (r && r.seqText) || '';
       // Safety: if something accidentally escaped newlines ("\\n"), restore real line breaks for legacy readers.
       if(text.indexOf('\\n') !== -1 && text.indexOf('\n') === -1){
         text = text.replace(/\\r\\n/g,'\n').replace(/\\n/g,'\n');
