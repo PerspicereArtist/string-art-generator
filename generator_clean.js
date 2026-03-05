@@ -146,6 +146,8 @@ function setText(id, v){ const el = $(id); if(el) el.textContent = String(v); }
   }
   function headerForColorName(name){
     const n = (name||'').toLowerCase();
+    // Match the "stacked" file quirk: blue uses '# colour blue'
+    if(n === 'blue') return '# color blue';
     return '# color ' + n;
   }
   function hexFromColorName(name){
@@ -827,7 +829,6 @@ function pickBestNext(curPin, cIdx){
         s += hotspotHits * HOTSPOT_WEIGHT;
 
         // Highway suppression (soft): penalize edges that were used often in the recent window.
-        const eKey = edgeKey(curPin, cand);
         const recentCount = recentEdgeCounts.get(eKey) || 0;
         s -= HIGHWAY_PENALTY_K * recentCount;
 
@@ -933,12 +934,16 @@ function pickBestNext(curPin, cIdx){
       const usedEdge = edgeKey(curPin, pick.pin);
       recentEdgeQueue.push(usedEdge);
       recentEdgeCounts.set(usedEdge, (recentEdgeCounts.get(usedEdge) || 0) + 1);
+      recentEdgeSet.add(usedEdge);
       if(recentEdgeQueue.length > HIGHWAY_WINDOW){
         const dropped = recentEdgeQueue.shift();
         if(dropped !== undefined){
           const c = (recentEdgeCounts.get(dropped) || 0) - 1;
           if(c > 0) recentEdgeCounts.set(dropped, c);
-          else recentEdgeCounts.delete(dropped);
+          else {
+            recentEdgeCounts.delete(dropped);
+            recentEdgeSet.delete(dropped);
+          }
         }
       }
 
@@ -948,6 +953,7 @@ function pickBestNext(curPin, cIdx){
       // ---- adaptive phase switch per colour (A: based on "stopped finding new work")
       const st = colourState[cIdx];
       st.blockPos += 1;
+
       // track rolling improvement + novelty
       st.scores.push(pick.score);
       if(st.scores.length > 50) st.scores.shift();
