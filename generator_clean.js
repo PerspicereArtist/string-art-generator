@@ -130,7 +130,7 @@ function setText(id, v){ const el = $(id); if(el) el.textContent = String(v); }
   
   // ---------- Sequence export compatibility ----------
   // Your legacy replay reader expects:
-  //   # color <name>   (or # colour blue)
+  //   # color <name>
   //   <pin>
   //   <pin>
   // ... (walk format, one pin per line)
@@ -160,6 +160,37 @@ function setText(id, v){ const el = $(id); if(el) el.textContent = String(v); }
     if(n.startsWith('#')) return n;
     return '#ffffff';
   }
+
+  function validateSequenceText(text){
+    const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+    let sawHeader = false;
+    let pinCountAfterHeader = 0;
+    let previousWasHeader = false;
+
+    for(let i=0;i<lines.length;i++){
+      const raw = lines[i];
+      if(raw === '') continue;
+
+      if(raw.startsWith('#')){
+        if(!raw.startsWith('# color ')) return { ok:false, reason:`Invalid header at line ${i+1}: use # color` };
+        if(previousWasHeader) return { ok:false, reason:`Repeated headers without pins near line ${i+1}` };
+        sawHeader = true;
+        pinCountAfterHeader = 0;
+        previousWasHeader = true;
+        continue;
+      }
+
+      if(!/^\d+$/.test(raw)) return { ok:false, reason:`Invalid pin line ${i+1}: expected integer` };
+      if(!sawHeader) return { ok:false, reason:`Pin before first # color header at line ${i+1}` };
+
+      pinCountAfterHeader += 1;
+      previousWasHeader = false;
+    }
+
+    if(!sawHeader) return { ok:false, reason:'Missing # color header' };
+    return { ok:true, reason:'ok' };
+  }
+
 
 function getPalette(){
     /** @type {PaletteColor[]} */
@@ -630,7 +661,6 @@ function buildPins(wPins, hPins, workW, workH){
     const HIGHWAY_WINDOW = 400;
     const recentEdgeQueue = [];
     const recentEdgeCounts = new Map();
-    const recentEdgeSet = new Set();
 
     function updateHotspotForColour(cIdx){
       const resid = residuals[cIdx];
@@ -680,9 +710,12 @@ function buildPins(wPins, hPins, workW, workH){
 
 
     // angle histogram
-    const ANG_BINS = 18;
+    const ANG_BINS = 36;
     const angHist = new Uint32Array(ANG_BINS);
     const angFill = new Float32Array(ANG_BINS);
+    const ANG_WINDOW = 500;
+    const recentAngleQueue = [];
+    const recentAngleCounts = new Uint16Array(ANG_BINS);
 
     // helper: angle bin for a segment (0..pi)
     function angleBin(ax,ay,bx,by){
@@ -741,10 +774,6 @@ function pickBestNext(curPin, cIdx){
         if(prevPrevPin >= 0 && cand === prevPrevPin) continue;
 
         const B = pins[cand];
-
-        // Edge reuse prevention: reject recently used undirected edges.
-        const eKey = edgeKey(curPin, cand);
-        if(recentEdgeSet.has(eKey)) continue;
 
         // Hard rule enforcement (enabled flags must reject candidates, not penalize score).
         if(noSameEdgeConnections && sameEdge(curPin, cand, pins)) continue;
@@ -807,7 +836,8 @@ function pickBestNext(curPin, cIdx){
         const bin = angleBin(A.x,A.y,B.x,B.y);
         const bal = clamp(angleBal/50, 0, 1);
         if(bal>0){
-          const fill = angFill[bin] / (1 + angHist[bin]);
+          const recent = recentAngleCounts[bin];
+          const fill = (angFill[bin] / (1 + angHist[bin])) + (recent / Math.max(1, ANG_WINDOW));
           s *= 1.0 / (1.0 + bal * 2.2 * fill);
         }
 
@@ -949,6 +979,12 @@ function pickBestNext(curPin, cIdx){
       // update angle stats
       angHist[pick.bin] += 1;
       angFill[pick.bin] += pick.score;
+      recentAngleQueue.push(pick.bin);
+      recentAngleCounts[pick.bin] += 1;
+      if(recentAngleQueue.length > ANG_WINDOW){
+        const oldBin = recentAngleQueue.shift();
+        if(oldBin !== undefined && recentAngleCounts[oldBin] > 0) recentAngleCounts[oldBin] -= 1;
+      }
 
       // draw
       const A = pins[curPin];
@@ -1063,10 +1099,17 @@ function pickBestNext(curPin, cIdx){
 
     validateSequence(seqLines);
 
+    const seqText = seqLines.join('\n');
+    const seqCheck = validateSequenceText(seqText);
+    if(!seqCheck.ok){
+      alert('Sequence export validation failed: ' + seqCheck.reason);
+      throw new Error('Sequence export validation failed: ' + seqCheck.reason);
+    }
+
     setText('statusRight', 'Done.');
     setText('outInfo', `Done (${tokens.length} lines).`);
 
-    return { seqText: seqLines.join('\n'), workW, workH };
+    return { seqText, workW, workH };
   }
 
   
@@ -1187,7 +1230,7 @@ function pickBestNext(curPin, cIdx){
     try{
       const r = await runSolver({draft:false, liveDraw:false, renderMul:4});
       // keep latest in memory for create download convenience
-      let text = r?.seqText || '';
+      let text = (r && r.seqText) || '';
       if(text.indexOf('\\n') !== -1 && text.indexOf('\n') === -1){
         text = text.replace(/\\r\\n/g,'\n').replace(/\\n/g,'\n');
       }
@@ -1201,7 +1244,7 @@ function pickBestNext(curPin, cIdx){
   $('create').addEventListener('click', async ()=>{
     try{
       const r = await runSolver({draft:false});
-      let text = r?.seqText || '';
+      let text = (r && r.seqText) || '';
       // Safety: if something accidentally escaped newlines ("\\n"), restore real line breaks for legacy readers.
       if(text.indexOf('\\n') !== -1 && text.indexOf('\n') === -1){
         text = text.replace(/\\r\\n/g,'\n').replace(/\\n/g,'\n');
