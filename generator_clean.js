@@ -623,13 +623,13 @@ function buildPins(wPins, hPins, workW, workH){
     const noSameRowOrColumn = ruleFlag('noSameRowOrColumn', false);
     const cornerAvoidsAdjacentEdges = ruleFlag('cornerAvoidsAdjacentEdges', false);
 
-    // Edge reuse prevention: track recently used undirected edges.
-    const RECENT_EDGE_LIMIT = 200;
-    const recentEdgeQueue = [];
-    const recentEdgeSet = new Set();
-
     // Backtracking prevention state: previous segment start pin for A->B->A rejection.
     let prevPrevPin = -1;
+
+    // Highway suppression state: track recent edge usage counts in a sliding window.
+    const HIGHWAY_WINDOW = 400;
+    const recentEdgeQueue = [];
+    const recentEdgeCounts = new Map();
 
     function updateHotspotForColour(cIdx){
       const resid = residuals[cIdx];
@@ -725,6 +725,7 @@ function pickBestNext(curPin, cIdx){
 
       const temp = 0.03 + 0.25*f; // higher fade => more exploration
       const isDetail = (st.mode === 1);
+      const HIGHWAY_PENALTY_K = 0.22; // easy tuning knob for corridor/highway suppression
 
       // refresh hotspot on a fixed cadence (every N steps)
       if(st.blockPos >= st.nextHotAt){
@@ -796,6 +797,11 @@ function pickBestNext(curPin, cIdx){
           if(hotspotMask[idx]) hotspotHits += 1;
         }
         s += hotspotHits * HOTSPOT_WEIGHT;
+
+        // Highway suppression (soft): penalize edges that were used often in the recent window.
+        const eKey = edgeKey(curPin, cand);
+        const recentCount = recentEdgeCounts.get(eKey) || 0;
+        s -= HIGHWAY_PENALTY_K * recentCount;
 
         // angle balancing (lightweight): discourage bins that are overused
         const bin = angleBin(A.x,A.y,B.x,B.y);
@@ -894,13 +900,17 @@ function pickBestNext(curPin, cIdx){
       // apply
       applyLine(cIdx, pick.idxs, baseStrength);
 
-      // Edge reuse prevention: maintain an LRU window of recently used edges.
+      // Highway suppression bookkeeping: maintain counts in a recent sliding edge window.
       const usedEdge = edgeKey(curPin, pick.pin);
       recentEdgeQueue.push(usedEdge);
-      recentEdgeSet.add(usedEdge);
-      if(recentEdgeQueue.length > RECENT_EDGE_LIMIT){
+      recentEdgeCounts.set(usedEdge, (recentEdgeCounts.get(usedEdge) || 0) + 1);
+      if(recentEdgeQueue.length > HIGHWAY_WINDOW){
         const dropped = recentEdgeQueue.shift();
-        if(dropped !== undefined) recentEdgeSet.delete(dropped);
+        if(dropped !== undefined){
+          const c = (recentEdgeCounts.get(dropped) || 0) - 1;
+          if(c > 0) recentEdgeCounts.set(dropped, c);
+          else recentEdgeCounts.delete(dropped);
+        }
       }
 
       // Backtracking prevention state update for next move.
@@ -1010,6 +1020,50 @@ function pickBestNext(curPin, cIdx){
       }
       octx.globalAlpha = 1;
     }
+
+
+    function validateSequence(lines){
+      const segments = [];
+      let lastPin = null;
+      for(const line of lines){
+        if(!line) continue;
+        if(line.startsWith('# color ') || line.startsWith('# colour ')){
+          lastPin = null;
+          continue;
+        }
+        const pin = parseInt(line, 10);
+        if(!Number.isFinite(pin)) continue;
+        if(lastPin === null){
+          lastPin = pin;
+          continue;
+        }
+        segments.push([lastPin, pin]);
+        lastPin = pin;
+      }
+
+      let backtrackViolations = 0;
+      let ruleViolations = 0;
+
+      for(let i=1; i<segments.length; i++){
+        const p = segments[i-1];
+        const q = segments[i];
+        if(p[0] === q[1] && p[1] === q[0]) backtrackViolations += 1;
+      }
+
+      for(const seg of segments){
+        const a = seg[0], b = seg[1];
+        const A = pins[a], B = pins[b];
+        if(noSameEdgeConnections && sameEdge(a, b, pins)) ruleViolations += 1;
+        if(noSameRowOrColumn && (Math.abs(A.x - B.x) < 1e-6 || Math.abs(A.y - B.y) < 1e-6)) ruleViolations += 1;
+        if(cornerAvoidsAdjacentEdges && shouldRejectCornerAdjacent(A, B, workW, workH)) ruleViolations += 1;
+      }
+
+      console.log('[validateSequence] segments=', segments.length,
+        'A-B-A violations=', backtrackViolations,
+        'rule violations=', ruleViolations);
+    }
+
+    validateSequence(seqLines);
 
     setText('statusRight', 'Done.');
     setText('outInfo', `Done (${tokens.length} lines).`);
